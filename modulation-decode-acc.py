@@ -36,6 +36,7 @@ carrier is a separate channel competing against a fixed white-noise background.
 
 import os
 import math
+from typing import Optional
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -62,6 +63,15 @@ SNR_POWER = 0.20
 #   "composite_power"
 SNR_MODE = "per_carrier_power"
 
+# Noise spectrum: "white" (flat PSD) or "pink" (1/f power, 1/sqrt(f) amplitude).
+# Pink noise is normalized so that the stated SNR holds exactly at F_REF;
+# carriers below F_REF see worse SNR, carriers above see better.
+NOISE_SPECTRUM = "white"
+
+# Reference frequency for pink-noise SNR calibration.
+# Default: geometric mean of FREQ_MIN and FREQ_MAX.
+F_REF = math.sqrt(FREQ_MIN * FREQ_MAX)
+
 # Carrier count sweep.
 # You can raise this if long windows and low phase precision allow many carriers.
 K_VALUES = list(range(1, 81))
@@ -78,7 +88,7 @@ FS = 1000.0
 TRIAL_CHUNK = 500
 
 RANDOM_SEED = 1
-OUTDIR = "phase_decode_results"
+OUTDIR = "timing_results"
 
 
 # -----------------------------
@@ -94,6 +104,44 @@ def make_frequency_list(k: int, f_min: float, f_max: float) -> np.ndarray:
     if k == 1:
         return np.array([(f_min + f_max) / 2.0], dtype=float)
     return np.linspace(f_min, f_max, k, dtype=float)
+
+
+def generate_noise(
+    *,
+    shape: tuple,
+    sigma: float,
+    spectrum: str,
+    fs: float,
+    f_ref: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """
+    Generate noise calibrated so that the matched-filter projection at f_ref
+    sees a per-sample noise variance equal to sigma**2, regardless of spectrum.
+
+    For spectrum == "white": flat PSD, pure i.i.d. Gaussian samples.
+    For spectrum == "pink":  1/f power (1/sqrt(f) amplitude). The shaping
+        function is H(f) = sqrt(f_ref / f), so |H(f_ref)| = 1. This means
+        the matched filter at f_ref sees the same noise variance as the
+        white-noise case; carriers at f < f_ref see proportionally MORE
+        noise (variance scales as f_ref/f).
+    """
+    if spectrum == "white":
+        return rng.normal(0.0, sigma, size=shape)
+    if spectrum == "pink":
+        n_samples: int = shape[-1]
+        freqs_bin: np.ndarray = np.fft.rfftfreq(n_samples, d=1.0 / fs)
+        # H[k]: shape (n_samples//2 + 1,)
+        h: np.ndarray = np.zeros_like(freqs_bin)
+        positive_mask: np.ndarray = freqs_bin > 0
+        h[positive_mask] = np.sqrt(f_ref / freqs_bin[positive_mask])
+        white: np.ndarray = rng.normal(0.0, sigma, size=shape)
+        # rfft over the last axis.
+        w_freq: np.ndarray = np.fft.rfft(white, axis=-1)
+        w_shaped: np.ndarray = w_freq * h[None, :]
+        pink: np.ndarray = np.fft.irfft(w_shaped, n=n_samples, axis=-1)
+        return pink
+    raise ValueError(f"Unknown noise spectrum: {spectrum!r}")
 
 
 def nearest_phase_symbol(phi_hat: np.ndarray, m: int) -> np.ndarray:
@@ -117,6 +165,8 @@ def simulate_condition(
     n_trials: int,
     trial_chunk: int,
     rng: np.random.Generator,
+    noise_spectrum: str = "white",
+    f_ref: Optional[float] = None,
 ) -> dict:
     """
     Simulate one condition and return per-carrier and full-codeword accuracy.
@@ -177,7 +227,14 @@ def simulate_condition(
             - np.sin(phases) @ sin_basis
         )
 
-        noise = rng.normal(0.0, noise_sigma, size=signal.shape)
+        noise = generate_noise(
+            shape=signal.shape,
+            sigma=noise_sigma,
+            spectrum=noise_spectrum,
+            fs=fs,
+            f_ref=(f_ref if f_ref is not None else F_REF),
+            rng=rng,
+        )
         y = signal + noise
 
         # Matched projections: shapes [chunk, k]
@@ -206,6 +263,8 @@ def simulate_condition(
         "snr_power": snr_power,
         "snr_db": 10.0 * math.log10(snr_power),
         "snr_mode": snr_mode,
+        "noise_spectrum": noise_spectrum,
+        "f_ref_hz": (f_ref if f_ref is not None else F_REF),
         "freq_min_hz": FREQ_MIN,
         "freq_max_hz": FREQ_MAX,
         "freq_spacing_hz": freq_spacing,
@@ -245,6 +304,8 @@ def run_sweep(n_trials: int, target: float, rng: np.random.Generator) -> pd.Data
                     n_trials=n_trials,
                     trial_chunk=TRIAL_CHUNK,
                     rng=rng,
+                    noise_spectrum=NOISE_SPECTRUM,
+                    f_ref=F_REF,
                 )
                 row["target_accuracy"] = target
                 rows.append(row)
